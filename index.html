@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Office Pool Tracker</title>
+
+  <!-- Tailwind utility classes (no setup needed) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- React + ReactDOM (UMD builds) -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+
+  <!-- Babel so we can write JSX directly in the browser -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-gray-50">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useMemo, useState } = React;
+
+    function clsx(...classes) {
+      return classes.filter(Boolean).join(" ");
+    }
+
+    const MAX_GAMES_DEFAULT = 20;
+
+    function App() {
+      const [opponents, setOpponents] = useState([
+        { id: crypto.randomUUID(), name: "Alice", games: Array(MAX_GAMES_DEFAULT).fill(null) },
+      ]);
+      const [maxGames, setMaxGames] = useState(MAX_GAMES_DEFAULT);
+      const [meName, setMeName] = useState("Me");
+
+      const addOpponent = () => {
+        setOpponents(prev => [
+          ...prev,
+          { id: crypto.randomUUID(), name: "New Opponent", games: Array(maxGames).fill(null) },
+        ]);
+      };
+
+      const removeOpponent = (id) => {
+        setOpponents(prev => prev.filter(o => o.id !== id));
+      };
+
+      const renameOpponent = (id, name) => {
+        setOpponents(prev => prev.map(o => (o.id === id ? { ...o, name } : o)));
+      };
+
+      const setResult = (id, index, value) => {
+        setOpponents(prev =>
+          prev.map(o => {
+            if (o.id !== id) return o;
+            const next = [...o.games];
+            next[index] = value; // 'W' | 'L' | null
+            return { ...o, games: next };
+          })
+        );
+      };
+
+      const cycleResult = (current) => {
+        if (current === null) return "W";
+        if (current === "W") return "L";
+        return null; // L -> blank
+      };
+
+      const clearResults = (id) => {
+        setOpponents(prev => prev.map(o => (o.id === id ? { ...o, games: Array(maxGames).fill(null) } : o)));
+      };
+
+      const quickFill = (id, value) => {
+        setOpponents(prev => prev.map(o => (o.id === id ? { ...o, games: o.games.map(() => value) } : o)));
+      };
+
+      const changeMaxGames = (n) => {
+        const newN = Math.max(1, Math.min(100, Number(n) || MAX_GAMES_DEFAULT));
+        setMaxGames(newN);
+        setOpponents(prev =>
+          prev.map(o => {
+            const g = [...o.games];
+            if (g.length > newN) g.length = newN;            // truncate
+            if (g.length < newN) g.push(...Array(newN - g.length).fill(null)); // extend
+            return { ...o, games: g };
+          })
+        );
+      };
+
+      const overall = useMemo(() => {
+        const totals = opponents.reduce(
+          (acc, o) => {
+            const wins = o.games.filter(x => x === "W").length;
+            const losses = o.games.filter(x => x === "L").length;
+            acc.wins += wins;
+            acc.losses += losses;
+            return acc;
+          },
+          { wins: 0, losses: 0 }
+        );
+        const played = totals.wins + totals.losses;
+        const pct = played ? (totals.wins / played) * 100 : 0;
+        return { ...totals, played, pct };
+      }, [opponents]);
+
+      return (
+        <div className="min-h-screen bg-gray-50 text-gray-900 p-6">
+          <div className="max-w-5xl mx-auto">
+            <header className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+              <div>
+                <h1 className="text-2xl font-bold">Office Pool Tracker</h1>
+                <p className="text-sm text-gray-600">
+                  Track up to {maxGames} games per opponent. Click a game to cycle: blank → W → L → blank.
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-3 items-end">
+                <div className="flex flex-col">
+                  <label className="text-xs font-medium">Your Name</label>
+                  <input
+                    value={meName}
+                    onChange={(e) => setMeName(e.target.value)}
+                    className="px-3 py-2 rounded-xl border bg-white shadow-sm focus:outline-none"
+                  />
+                </div>
+                <div className="flex flex-col">
+                  <label className="text-xs font-medium">Games per Opponent</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={100}
+                    value={maxGames}
+                    onChange={(e) => changeMaxGames(e.target.value)}
+                    className="px-3 py-2 rounded-xl border bg-white shadow-sm focus:outline-none w-28"
+                  />
+                </div>
+                <button
+                  onClick={addOpponent}
+                  className="px-4 py-2 rounded-2xl bg-black text-white shadow hover:opacity-90"
+                >
+                  + Add Opponent
+                </button>
+              </div>
+            </header>
+
+            <section className="mb-6">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <div className="p-4 rounded-2xl bg-white shadow">
+                  <div className="text-xs text-gray-500">Total Played</div>
+                  <div className="text-2xl font-semibold">{overall.played}</div>
+                </div>
+                <div className="p-4 rounded-2xl bg-white shadow">
+                  <div className="text-xs text-gray-500">Record</div>
+                  <div className="text-2xl font-semibold">{overall.wins} - {overall.losses}</div>
+                </div>
+                <div className="p-4 rounded-2xl bg-white shadow">
+                  <div className="text-xs text-gray-500">Win Rate</div>
+                  <div className="text-2xl font-semibold">{overall.played ? (overall.pct).toFixed(1) : "0.0"}%</div>
+                </div>
+              </div>
+            </section>
+
+            <ul className="space-y-4">
+              {opponents.map((o, idx) => {
+                const wins = o.games.filter(x => x === "W").length;
+                const losses = o.games.filter(x => x === "L").length;
+                const played = wins + losses;
+                const pct = played ? ((wins / played) * 100).toFixed(1) : "0.0";
+
+                return (
+                  <li key={o.id} className="bg-white rounded-2xl shadow p-4">
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="flex items-center gap-3">
+                        <span className="inline-flex items-center justify-center w-8 h-8 rounded-full bg-gray-100 text-sm font-medium">
+                          {idx + 1}
+                        </span>
+                        <input
+                          value={o.name}
+                          onChange={(e) => renameOpponent(o.id, e.target.value)}
+                          className="px-3 py-2 rounded-xl border bg-white shadow-sm focus:outline-none font-medium"
+                        />
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-sm text-gray-600">
+                          {meName} vs <span className="font-medium">{o.name || "Opponent"}</span> — {wins}-{losses} • {pct}%
+                        </span>
+                        <div className="flex gap-2">
+                          <button onClick={() => quickFill(o.id, "W")} className="px-3 py-1 rounded-xl border shadow-sm">Fill W</button>
+                          <button onClick={() => quickFill(o.id, "L")} className="px-3 py-1 rounded-xl border shadow-sm">Fill L</button>
+                          <button onClick={() => clearResults(o.id)} className="px-3 py-1 rounded-xl border shadow-sm">Clear</button>
+                          <button onClick={() => removeOpponent(o.id)} className="px-3 py-1 rounded-xl border shadow-sm text-red-600">Remove</button>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="mt-4 flex flex-wrap gap-2">
+                      {o.games.map((val, i) => (
+                        <button
+                          key={i}
+                          onClick={() => setResult(o.id, i, cycleResult(val))}
+                          className={clsx(
+                            "w-10 h-10 rounded-xl border shadow-sm text-sm font-semibold",
+                            val === "W" && "bg-green-100 border-green-300",
+                            val === "L" && "bg-red-100 border-red-300"
+                          )}
+                          title={`Game ${i + 1}: ${val ?? "blank"}`}
+                        >
+                          {val ?? i + 1}
+                        </button>
+                      ))}
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+
+            {opponents.length === 0 && (
+              <div className="mt-10 text-center text-gray-500">
+                No opponents yet. Click “Add Opponent” to start.
+              </div>
+            )}
+
+            <footer className="mt-10 text-xs text-gray-500">
+              <p>Tip: Click a game to cycle blank → W → L. Adjust the games per opponent at the top (defaults to 20).</p>
+            </footer>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
