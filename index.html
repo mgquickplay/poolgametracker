@@ -1,53 +1,620 @@
-// File: Code.gs
-// Stores/retrieves encrypted text in Google Drive, keyed by ?key=... (your phrase hash).
-// Deploy: Deploy > New deployment > Web app > Execute as Me; Who has access: Anyone with the link.
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Office Pool Tracker</title>
 
-function doGet(e) {
-  const key = (e.parameter.key || "").trim();
-  const op = (e.parameter.op || "get").trim();
-  if (!key) return _resp(400, "Missing key");
-  if (op !== "get") return _resp(400, "Invalid op");
+  <!-- Tailwind -->
+  <script src="https://cdn.tailwindcss.com"></script>
 
-  const file = _findFile(key);
-  if (!file) return _resp(404, "Not found");
-  const content = file.getBlob().getDataAsString("UTF-8");
-  return _json(content);
-}
+  <!-- React + ReactDOM (UMD) -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
 
-function doPost(e) {
-  const key = (e.parameter.key || "").trim();
-  const op = (e.parameter.op || "put").trim();
-  if (!key) return _resp(400, "Missing key");
-  if (op !== "put") return _resp(400, "Invalid op");
+  <!-- Babel for JSX in-browser -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-gray-50">
+  <div id="root"></div>
 
-  const body = e.postData && e.postData.contents || "";
-  if (!body) return _resp(400, "Missing body");
+  <script type="text/babel">
+    const { useMemo, useState, useEffect } = React;
 
-  let file = _findFile(key);
-  if (file) file.setContent(body);
-  else file = DriveApp.createFile(key + ".json", body, MimeType.PLAIN_TEXT);
+    // =========================
+    // Utils & crypto helpers
+    // =========================
+    const MAX_GAMES_DEFAULT = 20;
 
-  return _resp(200, "OK");
-}
+    const bytesToBase64 = (bytes) => {
+      let s = ""; bytes.forEach(b => s += String.fromCharCode(b)); return btoa(s);
+    };
+    const base64ToBytes = (b64) => {
+      const bin = atob(b64); const out = new Uint8Array(bin.length);
+      for (let i=0;i<bin.length;i++) out[i] = bin.charCodeAt(i);
+      return out;
+    };
+    const strToUtf8 = (s) => new TextEncoder().encode(s);
+    const utf8ToStr = (u8) => new TextDecoder().decode(u8);
+    const base64url = (bytes) => bytesToBase64(bytes).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
 
-function _findFile(key) {
-  const it = DriveApp.getFilesByName(key + ".json");
-  return it.hasNext() ? it.next() : null;
-}
-function _json(text) {
-  const out = ContentService.createTextOutput(text);
-  out.setMimeType(ContentService.MimeType.JSON);
-  _cors(out);
-  return out;
-}
-function _resp(code, msg) {
-  const out = ContentService.createTextOutput(msg);
-  out.setMimeType(ContentService.MimeType.TEXT);
-  _cors(out);
-  return out;
-}
-function _cors(out) {
-  const resp = out;
-  // Apps Script doesn't let us set arbitrary headers in ContentService responses,
-  // but CORS is generally okay for simple GET/POST. If needed, enable CORS via HTMLService proxy.
-}
+    async function sha256Base64Url(str) {
+      const hash = await crypto.subtle.digest("SHA-256", strToUtf8(str));
+      return base64url(new Uint8Array(hash));
+    }
+
+    // AES-GCM + PBKDF2
+    async function encryptJSON(obj, passphrase) {
+      const data = strToUtf8(JSON.stringify(obj));
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const keyMaterial = await crypto.subtle.importKey("raw", strToUtf8(passphrase), "PBKDF2", false, ["deriveKey"]);
+      const key = await crypto.subtle.deriveKey(
+        { name:"PBKDF2", salt, iterations:150000, hash:"SHA-256" },
+        keyMaterial, { name:"AES-GCM", length:256 }, true, ["encrypt","decrypt"]
+      );
+      const ct = new Uint8Array(await crypto.subtle.encrypt({ name:"AES-GCM", iv }, key, data));
+      return { v:1, algo:"AES-GCM", kdf:"PBKDF2-SHA256", iter:150000,
+               salt: bytesToBase64(salt), iv: bytesToBase64(iv), ct: bytesToBase64(ct) };
+    }
+    async function decryptJSON(pkg, passphrase) {
+      const salt = base64ToBytes(pkg.salt);
+      const iv = base64ToBytes(pkg.iv);
+      const ct = base64ToBytes(pkg.ct);
+      const keyMaterial = await crypto.subtle.importKey("raw", strToUtf8(passphrase), "PBKDF2", false, ["deriveKey"]);
+      const key = await crypto.subtle.deriveKey(
+        { name:"PBKDF2", salt, iterations:pkg.iter||150000, hash:"SHA-256" },
+        keyMaterial, { name:"AES-GCM", length:256 }, true, ["encrypt","decrypt"]
+      );
+      const pt = new Uint8Array(await crypto.subtle.decrypt({ name:"AES-GCM", iv }, key, ct));
+      return JSON.parse(utf8ToStr(pt));
+    }
+
+    // GitHub helpers
+    const strToBase64 = (s) => btoa(unescape(encodeURIComponent(s)));
+    const base64ToStr = (b64) => decodeURIComponent(escape(atob(b64)));
+    async function ghGetFile({ user, repo, branch, path, token }) {
+      const url = `https://api.github.com/repos/${user}/${repo}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(branch)}`;
+      const headers = { "Accept":"application/vnd.github+json" };
+      if (token) headers["Authorization"] = `token ${token}`;
+      const res = await fetch(url, { headers });
+      if (res.status === 404) return { notFound: true };
+      if (!res.ok) throw new Error(`GitHub GET ${res.status}`);
+      return res.json();
+    }
+    async function ghPutFile({ user, repo, branch, path, token, contentBase64, sha }) {
+      const url = `https://api.github.com/repos/${user}/${repo}/contents/${encodeURIComponent(path)}`;
+      const body = { message:"Update Pool Tracker data", content:contentBase64, branch };
+      if (sha) body.sha = sha;
+      const res = await fetch(url, {
+        method:"PUT",
+        headers: { "Accept":"application/vnd.github+json", "Authorization": `token ${token}` },
+        body: JSON.stringify(body)
+      });
+      if (!res.ok) throw new Error(`GitHub PUT ${res.status}`);
+      return res.json();
+    }
+
+    function clsx(...xs){ return xs.filter(Boolean).join(" "); }
+
+    // =========================
+    // Lock Screen Shell
+    // =========================
+    function Shell() {
+      const [unlocked, setUnlocked] = useState(false);
+      const [passphrase, setPassphrase] = useState("");
+      const [vaultKey, setVaultKey] = useState(null); // storage key derived from phrase
+      const [error, setError] = useState("");
+
+      async function handleUnlock(e) {
+        e.preventDefault();
+        setError("");
+        const hash = await sha256Base64Url(passphrase || "");
+        const key = `pool-vault:${hash}`;
+        setVaultKey(key);
+        setUnlocked(true); // App will try to load (or create) data under this key
+      }
+
+      if (!unlocked) {
+        return (
+          <div className="min-h-screen flex items-center justify-center p-6">
+            <form onSubmit={handleUnlock} className="w-full max-w-sm bg-white rounded-2xl shadow p-6 space-y-4">
+              <h1 className="text-xl font-semibold">Unlock Pool Tracker</h1>
+              <p className="text-sm text-gray-600">Enter your unique phrase. Use the <em>same phrase</em> on any device to open the same data.</p>
+              <input
+                type="password"
+                placeholder="Your phrase"
+                className="w-full px-3 py-2 rounded-xl border bg-white shadow-sm focus:outline-none"
+                value={passphrase}
+                onChange={e=>setPassphrase(e.target.value)}
+                required
+              />
+              {error && <div className="text-sm text-red-600">{error}</div>}
+              <button className="w-full px-4 py-2 rounded-2xl bg-black text-white shadow">Unlock</button>
+              <p className="text-xs text-gray-500">Tip: Don’t forget this phrase. It’s used to encrypt & find your data.</p>
+            </form>
+          </div>
+        );
+      }
+
+      return <App passphrase={passphrase} vaultKey={vaultKey} reset={()=>{ setUnlocked(false); setPassphrase(""); setVaultKey(null); }}/>;
+    }
+
+    // =========================
+    // Main App
+    // =========================
+    function App({ passphrase, vaultKey, reset }) {
+      // Load encrypted state from localStorage for this vault
+      const loadVault = () => {
+        try {
+          const raw = localStorage.getItem(vaultKey);
+          if (!raw) return null;
+          return JSON.parse(raw);
+        } catch { return null; }
+      };
+
+      const [cloud, setCloud] = useState({
+        user: "", repo: "", branch: "main",
+        pathHint: "(auto from phrase)",  // shown only
+        pathOverride: "",                 // leave empty to auto-use path from phrase
+        token: "", rememberToken: false
+      });
+
+      const [initial, setInitial] = useState(() => null);
+      const [ready, setReady] = useState(false);
+
+      // Boot: decrypt local vault (if exists) or use defaults
+      useEffect(() => {
+        (async () => {
+          try {
+            const enc = loadVault();
+            if (enc) {
+              const dec = await decryptJSON(enc, passphrase);
+              setInitial({
+                opponents: dec.opponents?.map(o => ({ ...o, photo:o.photo??null })) ??
+                           [{ id: crypto.randomUUID(), name:"Alice", games:Array(MAX_GAMES_DEFAULT).fill(null), photo:null }],
+                maxGames: dec.maxGames ?? MAX_GAMES_DEFAULT,
+                meName: dec.meName ?? "Me"
+              });
+            } else {
+              setInitial({
+                opponents: [{ id: crypto.randomUUID(), name:"Alice", games:Array(MAX_GAMES_DEFAULT).fill(null), photo:null }],
+                maxGames: MAX_GAMES_DEFAULT,
+                meName: "Me"
+              });
+            }
+          } catch (e) {
+            alert("Unlock failed. Wrong phrase or corrupted data.");
+            reset();
+            return;
+          } finally {
+            setReady(true);
+          }
+        })();
+      }, [vaultKey]);
+
+      // Derive an auto cloud file path from the phrase (so you can load anywhere by entering the phrase)
+      const [autoPath, setAutoPath] = useState("(computing…)");
+      useEffect(() => {
+        (async () => {
+          const hash = await sha256Base64Url(passphrase || "");
+          setAutoPath(`data/${hash}.json`);
+        })();
+      }, [passphrase]);
+
+      if (!ready || !initial) {
+        return <div className="min-h-screen flex items-center justify-center text-gray-500">Loading…</div>;
+      }
+
+      return <InnerApp
+        initial={initial}
+        passphrase={passphrase}
+        vaultKey={vaultKey}
+        cloud={{...cloud, pathHint:autoPath}}
+        setCloud={setCloud}
+        lock={reset}
+      />;
+    }
+
+    function InnerApp({ initial, passphrase, vaultKey, cloud, setCloud, lock }) {
+      const [opponents, setOpponents] = useState(initial.opponents);
+      const [maxGames, setMaxGames] = useState(initial.maxGames);
+      const [meName, setMeName] = useState(initial.meName);
+      const [view, setView] = useState("tracker"); // tracker | league | settings
+
+      // Persist encrypted to localStorage for this vault
+      useEffect(() => {
+        (async () => {
+          const payload = { opponents, maxGames, meName, ts: Date.now() };
+          const enc = await encryptJSON(payload, passphrase);
+          localStorage.setItem(vaultKey, JSON.stringify(enc));
+        })();
+      }, [opponents, maxGames, meName, passphrase, vaultKey]);
+
+      // ---------- Actions ----------
+      const addOpponent = () => setOpponents(p => [...p, { id: crypto.randomUUID(), name:"New Opponent", games:Array(maxGames).fill(null), photo:null }]);
+      const removeOpponent = (id) => setOpponents(p => p.filter(o => o.id !== id));
+      const renameOpponent = (id, name) => setOpponents(p => p.map(o => o.id===id ? {...o, name} : o));
+      const setResult = (id, idx, val) => setOpponents(p => p.map(o => {
+        if (o.id !== id) return o;
+        const g = [...o.games]; g[idx] = val; return {...o, games:g};
+      }));
+      const cycleResult = (cur) => cur===null ? "W" : cur==="W" ? "L" : null;
+      const clearResults = (id) => setOpponents(p => p.map(o => o.id===id ? {...o, games:Array(maxGames).fill(null)} : o));
+      const quickFill = (id, v) => setOpponents(p => p.map(o => o.id===id ? {...o, games:o.games.map(()=>v)} : o));
+
+      const changeMaxGames = (n) => {
+        const newN = Math.max(1, Math.min(100, Number(n) || MAX_GAMES_DEFAULT));
+        setMaxGames(newN);
+        setOpponents(prev => prev.map(o => {
+          const g = [...o.games];
+          if (g.length > newN) g.length = newN;
+          if (g.length < newN) g.push(...Array(newN - g.length).fill(null));
+          return { ...o, games: g };
+        }));
+      };
+
+      // Photos
+      const setPhotoURL = (id) => {
+        const url = prompt("Paste image URL (must be public):");
+        if (!url) return;
+        setOpponents(p => p.map(o => o.id===id ? {...o, photo:{type:"url", src:url}} : o));
+      };
+      const uploadPhotoFile = (id, file) => {
+        if (!file) return;
+        const rd = new FileReader();
+        rd.onload = () => setOpponents(p => p.map(o => o.id===id ? {...o, photo:{type:"data", src:rd.result}} : o));
+        rd.readAsDataURL(file); // stored encrypted in your vault
+      };
+      const clearPhoto = (id) => setOpponents(p => p.map(o => o.id===id ? {...o, photo:null} : o));
+
+      // Overall & league
+      const overall = useMemo(() => {
+        const t = opponents.reduce((a,o)=>({
+          wins: a.wins + o.games.filter(x=>x==="W").length,
+          losses: a.losses + o.games.filter(x=>x==="L").length
+        }), {wins:0,losses:0});
+        const played = t.wins + t.losses;
+        const pct = played ? (t.wins/played)*100 : 0;
+        return {...t, played, pct};
+      }, [opponents]);
+
+      const league = useMemo(() => {
+        const rows = opponents.map(o => {
+          const wins = o.games.filter(x=>"W"===x).length;
+          const losses = o.games.filter(x=>"L"===x).length;
+          const played = wins + losses;
+          const pct = played ? (wins/played)*100 : 0;
+          return { id:o.id, name:o.name||"Opponent", wins, losses, played, pct, photo:o.photo };
+        });
+        rows.sort((a,b) => b.pct - a.pct || b.played - a.played || a.name.localeCompare(b.name));
+        return rows;
+      }, [opponents]);
+
+      // Export / Import (manual)
+      const exportJSON = () => {
+        const data = { opponents, maxGames, meName };
+        const blob = new Blob([JSON.stringify(data,null,2)], {type:"application/json"});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a"); a.href = url; a.download = "pool-tracker-data.json"; a.click();
+        setTimeout(()=>URL.revokeObjectURL(url), 1000);
+      };
+      const importJSON = (file) => {
+        if (!file) return;
+        const rd = new FileReader();
+        rd.onload = () => {
+          try {
+            const d = JSON.parse(rd.result);
+            if (!Array.isArray(d.opponents)) throw new Error("Invalid file");
+            setOpponents(d.opponents.map(o=>({...o, photo:o.photo??null})));
+            setMaxGames(d.maxGames||MAX_GAMES_DEFAULT);
+            setMeName(d.meName||"Me");
+            alert("Import complete.");
+          } catch(e){ alert("Import failed: "+e.message); }
+        };
+        rd.readAsText(file);
+      };
+
+      // ---------- Cloud sync (GitHub) ----------
+      async function saveToGitHub() {
+        try {
+          const path = cloud.pathOverride || cloud.pathHint;
+          if (!cloud.user || !cloud.repo || !path || !cloud.token) { alert("Fill GitHub fields."); return; }
+          const payload = { opponents, maxGames, meName, ts:Date.now() };
+          const enc = await encryptJSON(payload, passphrase);
+          const text = JSON.stringify(enc);
+          const existing = await ghGetFile({ user:cloud.user, repo:cloud.repo, branch:cloud.branch, path, token:cloud.token });
+          const sha = existing?.sha;
+          await ghPutFile({ user:cloud.user, repo:cloud.repo, branch:cloud.branch, path, token:cloud.token, contentBase64:strToBase64(text), sha });
+          alert("Saved to GitHub.");
+        } catch(e){ alert("Save failed: "+e.message); }
+      }
+      async function loadFromGitHub() {
+        try {
+          const path = cloud.pathOverride || cloud.pathHint;
+          if (!cloud.user || !cloud.repo || !path) { alert("Fill GitHub fields."); return; }
+          const res = await ghGetFile({ user:cloud.user, repo:cloud.repo, branch:cloud.branch, path, token:cloud.token });
+          if (res.notFound) { alert("No file found at that path."); return; }
+          const enc = JSON.parse(base64ToStr(res.content));
+          const data = await decryptJSON(enc, passphrase);
+          setOpponents(data.opponents.map(o=>({...o, photo:o.photo??null})));
+          setMaxGames(data.maxGames||MAX_GAMES_DEFAULT);
+          setMeName(data.meName||"Me");
+          alert("Loaded from GitHub.");
+        } catch(e){ alert("Load failed: "+e.message); }
+      }
+
+      // ---------- Cloud sync (Google Apps Script) ----------
+      const [gasUrl, setGasUrl] = useState("");
+      // Web app contract: GET ?op=get&key=...  -> returns encrypted JSON string
+      //                    POST ?op=put&key=... body=text/plain (encrypted JSON)
+      const [vaultHash, setVaultHash] = useState("(hashing…)");
+      useEffect(()=>{ (async()=>setVaultHash(await sha256Base64Url(passphrase||"")))(); }, [passphrase]);
+
+      async function saveToDrive() {
+        try {
+          if (!gasUrl) { alert("Enter your Apps Script Web App URL."); return; }
+          const payload = { opponents, maxGames, meName, ts:Date.now() };
+          const enc = await encryptJSON(payload, passphrase);
+          const text = JSON.stringify(enc);
+          const res = await fetch(`${gasUrl}?op=put&key=${encodeURIComponent(vaultHash)}`, {
+            method:"POST", headers:{ "Content-Type":"text/plain" }, body:text
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          alert("Saved to Drive (Apps Script).");
+        } catch(e){ alert("Save failed: "+e.message); }
+      }
+      async function loadFromDrive() {
+        try {
+          if (!gasUrl) { alert("Enter your Apps Script Web App URL."); return; }
+          const res = await fetch(`${gasUrl}?op=get&key=${encodeURIComponent(vaultHash)}`);
+          if (res.status === 404) { alert("No data found for this phrase."); return; }
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const text = await res.text();
+          const enc = JSON.parse(text);
+          const data = await decryptJSON(enc, passphrase);
+          setOpponents(data.opponents.map(o=>({...o, photo:o.photo??null})));
+          setMaxGames(data.maxGames||MAX_GAMES_DEFAULT);
+          setMeName(data.meName||"Me");
+          alert("Loaded from Drive.");
+        } catch(e){ alert("Load failed: "+e.message); }
+      }
+
+      // ---------- UI ----------
+      const TabButton = ({ id, children }) => (
+        <button onClick={()=>setView(id)}
+          className={clsx("px-3 py-2 rounded-2xl border shadow-sm text-sm",
+                          view===id ? "bg-black text-white" : "bg-white")}>
+          {children}
+        </button>
+      );
+
+      return (
+        <div className="min-h-screen text-gray-900 p-6">
+          <div className="max-w-6xl mx-auto">
+            <header className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+              <div>
+                <h1 className="text-2xl font-bold">Office Pool Tracker</h1>
+                <p className="text-sm text-gray-600">
+                  Locked vault • Phrase-derived cloud path • All data encrypted with your phrase
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-2 items-end">
+                <TabButton id="tracker">Tracker</TabButton>
+                <TabButton id="league">League</TabButton>
+                <TabButton id="settings">Settings</TabButton>
+                <button onClick={lock} className="px-3 py-2 rounded-2xl border shadow-sm text-sm">Lock</button>
+              </div>
+            </header>
+
+            {view === "tracker" && (
+              <>
+                <section className="mb-6">
+                  <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+                    <div className="p-4 rounded-2xl bg-white shadow">
+                      <div className="text-xs text-gray-500">Your Name</div>
+                      <input value={meName} onChange={e=>setMeName(e.target.value)}
+                             className="mt-1 w-full px-3 py-2 rounded-xl border bg-white shadow-sm focus:outline-none" />
+                    </div>
+                    <div className="p-4 rounded-2xl bg-white shadow">
+                      <div className="text-xs text-gray-500">Games per Opponent</div>
+                      <input type="number" min={1} max={100} value={maxGames}
+                             onChange={e=>changeMaxGames(e.target.value)}
+                             className="mt-1 w-full px-3 py-2 rounded-xl border bg-white shadow-sm focus:outline-none" />
+                    </div>
+                    <div className="p-4 rounded-2xl bg-white shadow">
+                      <div className="text-xs text-gray-500">Overall Record</div>
+                      <div className="text-2xl font-semibold">{overall.wins} - {overall.losses}</div>
+                    </div>
+                    <div className="p-4 rounded-2xl bg-white shadow">
+                      <div className="text-xs text-gray-500">Win Rate</div>
+                      <div className="text-2xl font-semibold">{overall.played ? overall.pct.toFixed(1) : "0.0"}%</div>
+                    </div>
+                  </div>
+                </section>
+
+                <div className="mb-4 flex gap-2">
+                  <button onClick={addOpponent} className="px-4 py-2 rounded-2xl bg-black text-white shadow hover:opacity-90">+ Add Opponent</button>
+                </div>
+
+                  <ul className="space-y-4">
+                    {opponents.map((o, idx) => {
+                      const wins = o.games.filter(x => x === "W").length;
+                      const losses = o.games.filter(x => x === "L").length;
+                      const played = wins + losses;
+                      const pct = played ? ((wins / played) * 100).toFixed(1) : "0.0";
+
+                      return (
+                        <li key={o.id} className="bg-white rounded-2xl shadow p-4">
+                          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                            <div className="flex items-center gap-3">
+                              <div className="w-12 h-12 rounded-full bg-gray-100 overflow-hidden flex items-center justify-center">
+                                {o.photo ? (
+                                  <img src={o.photo.src} alt="" className="w-full h-full object-cover"/>
+                                ) : (
+                                  <span className="text-sm text-gray-500">{(o.name||"Opp")[0]}</span>
+                                )}
+                              </div>
+                              <input
+                                value={o.name}
+                                onChange={(e)=>renameOpponent(o.id, e.target.value)}
+                                className="px-3 py-2 rounded-xl border bg-white shadow-sm focus:outline-none font-medium"
+                              />
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="text-sm text-gray-600">
+                                {meName} vs <span className="font-medium">{o.name || "Opponent"}</span> — {wins}-{losses} • {pct}%
+                              </span>
+                              <div className="flex gap-2">
+                                <button onClick={()=>quickFill(o.id,"W")} className="px-3 py-1 rounded-xl border shadow-sm">Fill W</button>
+                                <button onClick={()=>quickFill(o.id,"L")} className="px-3 py-1 rounded-xl border shadow-sm">Fill L</button>
+                                <button onClick={()=>clearResults(o.id)} className="px-3 py-1 rounded-xl border shadow-sm">Clear</button>
+                                <button onClick={()=>removeOpponent(o.id)} className="px-3 py-1 rounded-xl border shadow-sm text-red-600">Remove</button>
+                              </div>
+                              <div className="flex gap-2 ml-2">
+                                <label className="px-3 py-1 rounded-xl border shadow-sm cursor-pointer">
+                                  Upload Photo
+                                  <input type="file" accept="image/*" className="hidden" onChange={(e)=>uploadPhotoFile(o.id, e.target.files[0])}/>
+                                </label>
+                                <button onClick={()=>setPhotoURL(o.id)} className="px-3 py-1 rounded-xl border shadow-sm">Photo URL</button>
+                                {o.photo && <button onClick={()=>clearPhoto(o.id)} className="px-3 py-1 rounded-xl border shadow-sm">Clear Photo</button>}
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="mt-4 flex flex-wrap gap-2">
+                            {o.games.map((val, i) => (
+                              <button
+                                key={i}
+                                onClick={()=>setResult(o.id,i,cycleResult(val))}
+                                className={clsx(
+                                  "w-10 h-10 rounded-xl border shadow-sm text-sm font-semibold",
+                                  val==="W" && "bg-green-100 border-green-300",
+                                  val==="L" && "bg-red-100 border-red-300"
+                                )}
+                                title={`Game ${i+1}: ${val ?? "blank"}`}
+                              >
+                                {val ?? i+1}
+                              </button>
+                            ))}
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ul>
+              </>
+            )}
+
+            {view === "league" && (
+              <section className="bg-white rounded-2xl shadow p-4">
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-lg font-semibold">League Table</h2>
+                  <div className="text-sm text-gray-500">Ranked by win % (then games played)</div>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="min-w-full text-sm">
+                    <thead className="text-left text-gray-600">
+                      <tr>
+                        <th className="py-2 pr-4">#</th>
+                        <th className="py-2 pr-4">Opponent</th>
+                        <th className="py-2 pr-4">Played</th>
+                        <th className="py-2 pr-4">Wins</th>
+                        <th className="py-2 pr-4">Losses</th>
+                        <th className="py-2 pr-4">Win %</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {league.map((r,i)=>(
+                        <tr key={r.id} className="border-t">
+                          <td className="py-2 pr-4">{i+1}</td>
+                          <td className="py-2 pr-4">
+                            <div className="flex items-center gap-2">
+                              <div className="w-8 h-8 rounded-full overflow-hidden bg-gray-100 flex items-center justify-center">
+                                {r.photo ? <img src={r.photo.src} alt="" className="w-full h-full object-cover"/> : <span className="text-xs text-gray-500">{(r.name||"O")[0]}</span>}
+                              </div>
+                              <span className="font-medium">{r.name}</span>
+                            </div>
+                          </td>
+                          <td className="py-2 pr-4">{r.played}</td>
+                          <td className="py-2 pr-4">{r.wins}</td>
+                          <td className="py-2 pr-4">{r.losses}</td>
+                          <td className="py-2 pr-4">{r.played ? r.pct.toFixed(1) : "0.0"}%</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+            )}
+
+            {view === "settings" && (
+              <section className="bg-white rounded-2xl shadow p-4 space-y-6">
+                <div>
+                  <h2 className="text-lg font-semibold mb-2">Export / Import (manual)</h2>
+                  <div className="flex flex-wrap gap-2">
+                    <button onClick={exportJSON} className="px-4 py-2 rounded-2xl border shadow-sm">Download JSON</button>
+                    <label className="px-4 py-2 rounded-2xl border shadow-sm cursor-pointer">
+                      Import JSON
+                      <input type="file" accept="application/json" className="hidden" onChange={(e)=>importJSON(e.target.files[0])}/>
+                    </label>
+                  </div>
+                </div>
+
+                <div>
+                  <h2 className="text-lg font-semibold mb-2">Cloud Sync via GitHub (encrypted)</h2>
+                  <p className="text-sm text-gray-600 mb-3">
+                    Uses your phrase to pick a file path automatically. Enter your GitHub details to save/load the encrypted data.
+                  </p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                    <input placeholder="GitHub Username" className="px-3 py-2 rounded-xl border bg-white shadow-sm"
+                           value={cloud.user} onChange={e=>setCloud({...cloud, user:e.target.value})}/>
+                    <input placeholder="Repository (e.g., pool-tracker)" className="px-3 py-2 rounded-xl border bg-white shadow-sm"
+                           value={cloud.repo} onChange={e=>setCloud({...cloud, repo:e.target.value})}/>
+                    <input placeholder="Branch (e.g., main)" className="px-3 py-2 rounded-xl border bg-white shadow-sm"
+                           value={cloud.branch} onChange={e=>setCloud({...cloud, branch:e.target.value})}/>
+                    <input value={cloud.pathHint} disabled className="px-3 py-2 rounded-xl border bg-gray-100 shadow-sm"
+                           title="Auto path derived from your phrase"/>
+                    <input placeholder="Or custom path (optional)" className="px-3 py-2 rounded-xl border bg-white shadow-sm"
+                           value={cloud.pathOverride} onChange={e=>setCloud({...cloud, pathOverride:e.target.value})}/>
+                    <input placeholder="Personal Access Token (repo scope)" type="password" className="px-3 py-2 rounded-xl border bg-white shadow-sm"
+                           value={cloud.token} onChange={e=>setCloud({...cloud, token:e.target.value})}/>
+                    <label className="inline-flex items-center gap-2 text-sm">
+                      <input type="checkbox" checked={cloud.rememberToken}
+                             onChange={e=>setCloud({...cloud, rememberToken:e.target.checked})}/>
+                      Remember token on this device
+                    </label>
+                  </div>
+                  <div className="mt-3 flex gap-2">
+                    <button onClick={saveToGitHub} className="px-4 py-2 rounded-2xl bg-black text-white shadow">Save to GitHub</button>
+                    <button onClick={loadFromGitHub} className="px-4 py-2 rounded-2xl border shadow-sm">Load from GitHub</button>
+                  </div>
+                </div>
+
+                <div>
+                  <h2 className="text-lg font-semibold mb-2">Cloud Sync via Google Drive (Apps Script)</h2>
+                  <p className="text-sm text-gray-600 mb-2">
+                    Deploy one tiny Apps Script as a Web App (all in your browser). Enter its URL here and use your phrase to save/load anywhere.
+                  </p>
+                  <input placeholder="Apps Script Web App URL" className="w-full px-3 py-2 rounded-xl border bg-white shadow-sm"
+                         value={gasUrl} onChange={e=>setGasUrl(e.target.value)} />
+                  <div className="mt-3 flex gap-2">
+                    <button onClick={saveToDrive} className="px-4 py-2 rounded-2xl border shadow-sm">Save to Drive</button>
+                    <button onClick={loadFromDrive} className="px-4 py-2 rounded-2xl border shadow-sm">Load from Drive</button>
+                  </div>
+                </div>
+              </section>
+            )}
+
+            <footer className="mt-10 text-xs text-gray-500 text-center">
+              <p>Tip: Use the same phrase on any device. For cross-device sync, use GitHub or Apps Script.</p>
+            </footer>
+          </div>
+        </div>
+      );
+    }
+
+    // Mount
+    ReactDOM.createRoot(document.getElementById("root")).render(<Shell />);
+  </script>
+</body>
+</html>
