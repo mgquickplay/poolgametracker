@@ -12,27 +12,46 @@
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
 
-  <!-- Babel so we can write JSX directly in the browser -->
+  <!-- Babel so we can write JSX directly in the page -->
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 </head>
 <body class="bg-gray-50">
   <div id="root"></div>
 
   <script type="text/babel">
-    const { useMemo, useState } = React;
+    const { useMemo, useState, useEffect } = React;
+
+    // ---- Helpers ----
+    const STORAGE_KEY = "pool-tracker-v1";
+    const MAX_GAMES_DEFAULT = 20;
 
     function clsx(...classes) {
       return classes.filter(Boolean).join(" ");
     }
 
-    const MAX_GAMES_DEFAULT = 20;
+    const loadSaved = () => {
+      try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || null; }
+      catch { return null; }
+    };
+
+    const saveState = (data) => {
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); }
+      catch {}
+    };
 
     function App() {
-      const [opponents, setOpponents] = useState([
-        { id: crypto.randomUUID(), name: "Alice", games: Array(MAX_GAMES_DEFAULT).fill(null) },
-      ]);
-      const [maxGames, setMaxGames] = useState(MAX_GAMES_DEFAULT);
-      const [meName, setMeName] = useState("Me");
+      const saved = loadSaved();
+
+      const [opponents, setOpponents] = useState(
+        saved?.opponents ?? [{ id: crypto.randomUUID(), name: "Alice", games: Array(MAX_GAMES_DEFAULT).fill(null) }]
+      );
+      const [maxGames, setMaxGames] = useState(saved?.maxGames ?? MAX_GAMES_DEFAULT);
+      const [meName, setMeName] = useState(saved?.meName ?? "Me");
+
+      // Persist to localStorage whenever state changes
+      useEffect(() => {
+        saveState({ opponents, maxGames, meName });
+      }, [opponents, maxGames, meName]);
 
       const addOpponent = () => {
         setOpponents(prev => [
@@ -80,7 +99,7 @@
         setOpponents(prev =>
           prev.map(o => {
             const g = [...o.games];
-            if (g.length > newN) g.length = newN;            // truncate
+            if (g.length > newN) g.length = newN;                       // truncate
             if (g.length < newN) g.push(...Array(newN - g.length).fill(null)); // extend
             return { ...o, games: g };
           })
@@ -102,6 +121,11 @@
         const pct = played ? (totals.wins / played) * 100 : 0;
         return { ...totals, played, pct };
       }, [opponents]);
+
+      const resetAll = () => {
+        localStorage.removeItem(STORAGE_KEY);
+        location.reload();
+      };
 
       return (
         <div className="min-h-screen bg-gray-50 text-gray-900 p-6">
@@ -138,6 +162,13 @@
                   className="px-4 py-2 rounded-2xl bg-black text-white shadow hover:opacity-90"
                 >
                   + Add Opponent
+                </button>
+                <button
+                  onClick={resetAll}
+                  className="px-4 py-2 rounded-2xl border shadow-sm"
+                  title="Clear saved data and start fresh"
+                >
+                  Reset All
                 </button>
               </div>
             </header>
