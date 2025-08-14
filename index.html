@@ -3,351 +3,351 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Office Pool Tracker</title>
+  <title>Pool Tracker</title>
 
-  <!-- Tailwind (utility CSS) -->
+  <!-- Tailwind (Play CDN) with dark-mode via class -->
+  <script>
+    window.tailwind = window.tailwind || {};
+    tailwind.config = { darkMode: 'class' };
+  </script>
   <script src="https://cdn.tailwindcss.com"></script>
 
-  <!-- React 18 + ReactDOM UMD -->
+  <!-- React 18 UMD + ReactDOM UMD -->
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
 
-  <!-- Babel to allow JSX in-browser -->
+  <!-- Babel so we can write JSX in-page -->
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- Simple emoji favicon (🎱) -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8E%B1%3C/text%3E%3C/svg%3E">
 </head>
-<body class="bg-gray-50">
+<body class="bg-gray-50 dark:bg-neutral-950">
   <div id="root"></div>
 
   <script type="text/babel">
-    const { useMemo, useState, useEffect } = React;
+    const { useState, useMemo, useEffect, useRef } = React;
 
-    // ====== Small helpers ======
+    // ========== CONFIG: set your Apps Script URL here ==========
+    // IMPORTANT: paste your exact Web App URL (ends with /exec) between the quotes.
+    const GAS_WEB_APP_URL = "REPLACE_WITH_YOUR_APPS_SCRIPT_WEB_APP_URL";
+
+    // ========= Utilities =========
     const MAX_GAMES_DEFAULT = 20;
-    const PREF_GAS_URL = "pool-pref-gas-url";
-    const PREF_AUTO_LOAD = "pool-pref-auto-load";
-    const PREF_AUTO_SAVE = "pool-pref-auto-save";
-
     const clsx = (...xs) => xs.filter(Boolean).join(" ");
-    const strToUtf8 = (s) => new TextEncoder().encode(s);
-    const utf8ToStr = (u8) => new TextDecoder().decode(u8);
-    const bytesToBase64 = (bytes) => { let s=""; bytes.forEach(b=>s+=String.fromCharCode(b)); return btoa(s); };
-    const base64ToBytes = (b64) => { const bin=atob(b64); const out=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i); return out; };
-    const base64url = (bytes) => bytesToBase64(bytes).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
-    async function sha256Base64Url(str){ const h=await crypto.subtle.digest("SHA-256", strToUtf8(str)); return base64url(new Uint8Array(h)); }
-    const getQuery = (k) => new URLSearchParams(location.search).get(k);
+    const utf8enc = new TextEncoder();
+    const utf8dec = new TextDecoder();
+    const strToBytes = (s) => utf8enc.encode(s);
+    const bytesToStr = (b) => utf8dec.decode(b);
+    const b64 = (u8) => btoa(String.fromCharCode(...u8));
+    const unb64 = (s) => new Uint8Array(atob(s).split("").map(c=>c.charCodeAt(0)));
+    const b64url = (u8) => b64(u8).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+    async function sha256Base64Url(str) {
+      const hash = await crypto.subtle.digest("SHA-256", strToBytes(str));
+      return b64url(new Uint8Array(hash));
+    }
 
-    // ====== Encrypt / Decrypt (AES-GCM + PBKDF2) ======
+    // Encryption: AES-GCM with PBKDF2
     async function encryptJSON(obj, passphrase) {
-      const data = strToUtf8(JSON.stringify(obj));
       const salt = crypto.getRandomValues(new Uint8Array(16));
-      const iv = crypto.getRandomValues(new Uint8Array(12));
-      const keyMaterial = await crypto.subtle.importKey("raw", strToUtf8(passphrase), "PBKDF2", false, ["deriveKey"]);
+      const iv   = crypto.getRandomValues(new Uint8Array(12));
+      const keyMat = await crypto.subtle.importKey("raw", strToBytes(passphrase), "PBKDF2", false, ["deriveKey"]);
       const key = await crypto.subtle.deriveKey(
         { name:"PBKDF2", salt, iterations:150000, hash:"SHA-256" },
-        keyMaterial, { name:"AES-GCM", length:256 }, true, ["encrypt","decrypt"]
+        keyMat, { name:"AES-GCM", length:256 }, true, ["encrypt","decrypt"]
       );
-      const ct = new Uint8Array(await crypto.subtle.encrypt({ name:"AES-GCM", iv }, key, data));
-      return { v:1, algo:"AES-GCM", kdf:"PBKDF2-SHA256", iter:150000, salt: bytesToBase64(salt), iv: bytesToBase64(iv), ct: bytesToBase64(ct) };
+      const pt = strToBytes(JSON.stringify(obj));
+      const ct = new Uint8Array(await crypto.subtle.encrypt({ name:"AES-GCM", iv }, key, pt));
+      return { v:1, algo:"AES-GCM", kdf:"PBKDF2-SHA256", iter:150000,
+               salt:b64(salt), iv:b64(iv), ct:b64(ct) };
     }
     async function decryptJSON(pkg, passphrase) {
-      const salt = base64ToBytes(pkg.salt);
-      const iv = base64ToBytes(pkg.iv);
-      const ct = base64ToBytes(pkg.ct);
-      const keyMaterial = await crypto.subtle.importKey("raw", strToUtf8(passphrase), "PBKDF2", false, ["deriveKey"]);
+      const salt = unb64(pkg.salt), iv = unb64(pkg.iv), ct = unb64(pkg.ct);
+      const keyMat = await crypto.subtle.importKey("raw", strToBytes(passphrase), "PBKDF2", false, ["deriveKey"]);
       const key = await crypto.subtle.deriveKey(
         { name:"PBKDF2", salt, iterations:pkg.iter||150000, hash:"SHA-256" },
-        keyMaterial, { name:"AES-GCM", length:256 }, true, ["encrypt","decrypt"]
+        keyMat, { name:"AES-GCM", length:256 }, true, ["encrypt","decrypt"]
       );
-      const pt = new Uint8Array(await crypto.subtle.decrypt({ name:"AES-GCM", iv }, key, ct));
-      return JSON.parse(utf8ToStr(pt));
+      const pt = await crypto.subtle.decrypt({ name:"AES-GCM", iv }, key, ct);
+      return JSON.parse(bytesToStr(new Uint8Array(pt)));
     }
 
-    // ====== Apps Script fetch helpers ======
-    // GET ?op=get&key=VAULT_HASH  -> returns encrypted JSON string
-    // POST ?op=put&key=VAULT_HASH  body=text/plain (encrypted JSON) -> 200 OK
-    async function driveLoad(gasUrl, key) {
-      const res = await fetch(`${gasUrl}?op=get&key=${encodeURIComponent(key)}`);
+    // Drive API via Apps Script
+    async function driveGet(url, key) {
+      const res = await fetch(`${url}?op=get&key=${encodeURIComponent(key)}`);
       if (res.status === 404) return null;
-      if (!res.ok) throw new Error(`Drive load HTTP ${res.status}`);
-      const text = await res.text();
-      return JSON.parse(text);
+      if (!res.ok) throw new Error(`GET ${res.status}`);
+      return JSON.parse(await res.text());
     }
-    async function driveSave(gasUrl, key, encryptedJsonText) {
-      const res = await fetch(`${gasUrl}?op=put&key=${encodeURIComponent(key)}`, {
-        method: "POST",
-        headers: { "Content-Type":"text/plain" },
-        body: encryptedJsonText
+    async function drivePut(url, key, encryptedText) {
+      const res = await fetch(`${url}?op=put&key=${encodeURIComponent(key)}`, {
+        method:"POST", headers:{ "Content-Type":"text/plain" }, body: encryptedText
       });
-      if (!res.ok) throw new Error(`Drive save HTTP ${res.status}`);
+      if (!res.ok) throw new Error(`PUT ${res.status}`);
       return true;
     }
 
-    // ====== Lock shell ======
-    function Shell() {
-      const [phrase, setPhrase] = useState("");
-      const [vaultKey, setVaultKey] = useState(null);
+    // Debounce helper
+    function useDebouncedCallback(fn, delay=700) {
+      const t = useRef(null);
+      return (...args) => {
+        if (t.current) clearTimeout(t.current);
+        t.current = setTimeout(() => fn(...args), delay);
+      };
+    }
 
-      async function unlock(e) {
+    // ========= Lock Screen =========
+    function Lock({ onUnlock }) {
+      const [phrase, setPhrase] = useState("");
+      const [error, setError] = useState("");
+
+      async function handleUnlock(e) {
         e.preventDefault();
-        const hash = await sha256Base64Url(phrase || "");
-        setVaultKey(`pool-vault:${hash}`);
+        try {
+          const hash = await sha256Base64Url(phrase || "");
+          onUnlock({ passphrase: phrase, vaultHash: hash });
+        } catch (e) {
+          setError("Your browser doesn't support required crypto features.");
+        }
       }
 
-      if (!vaultKey) {
+      return (
+        <div className="min-h-screen flex items-center justify-center p-6">
+          <form onSubmit={handleUnlock} className="w-full max-w-sm bg-white dark:bg-neutral-900 rounded-2xl shadow p-6 space-y-4 border border-gray-200/60 dark:border-neutral-800">
+            <h1 className="text-xl font-semibold text-gray-900 dark:text-white">Unlock Pool Tracker</h1>
+            <p className="text-sm text-gray-600 dark:text-neutral-400">Enter your secret phrase. Use the same phrase on any device to open the same data.</p>
+            <input
+              type="password"
+              className="w-full px-3 py-2 rounded-xl border bg-white dark:bg-neutral-800 dark:text-white shadow-sm focus:outline-none"
+              placeholder="Your phrase"
+              value={phrase}
+              onChange={(e)=>setPhrase(e.target.value)}
+              required
+            />
+            {error && <div className="text-sm text-red-600">{error}</div>}
+            <button className="w-full px-4 py-2 rounded-2xl bg-black text-white dark:bg-white dark:text-black shadow">Unlock</button>
+            <p className="text-xs text-gray-500 dark:text-neutral-500">We never send your phrase anywhere. It encrypts/decrypts only in your browser.</p>
+          </form>
+        </div>
+      );
+    }
+
+    // ========= Main App =========
+    function App() {
+      const [session, setSession] = useState(null); // { passphrase, vaultHash }
+      const [theme, setTheme] = useState("light");  // 'light' | 'dark' — saved in cloud with your data
+      useEffect(()=> {
+        document.documentElement.classList.toggle("dark", theme === "dark");
+      }, [theme]);
+
+      if (!GAS_WEB_APP_URL || GAS_WEB_APP_URL.startsWith("REPLACE_")) {
         return (
           <div className="min-h-screen flex items-center justify-center p-6">
-            <form onSubmit={unlock} className="w-full max-w-sm bg-white rounded-2xl shadow p-6 space-y-4">
-              <h1 className="text-xl font-semibold">Unlock Pool Tracker</h1>
-              <p className="text-sm text-gray-600">Enter your unique phrase. Use the same phrase on any device.</p>
-              <input type="password" className="w-full px-3 py-2 rounded-xl border bg-white shadow-sm focus:outline-none"
-                     placeholder="Your phrase" value={phrase} onChange={(e)=>setPhrase(e.target.value)} required />
-              <button className="w-full px-4 py-2 rounded-2xl bg-black text-white shadow">Unlock</button>
-            </form>
+            <div className="max-w-xl text-center bg-white dark:bg-neutral-900 rounded-2xl shadow p-6 border border-gray-200/60 dark:border-neutral-800">
+              <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">Setup required</h2>
+              <p className="text-sm text-gray-700 dark:text-neutral-300">
+                You need to set <code className="font-mono">GAS_WEB_APP_URL</code> at the top of <code className="font-mono">index.html</code>
+                to your Google Apps Script Web App URL (the one ending with <code className="font-mono">/exec</code>).
+              </p>
+            </div>
           </div>
         );
       }
 
-      return <App passphrase={phrase} vaultKey={vaultKey} relock={()=>{ setVaultKey(null); setPhrase(""); }} />;
+      if (!session) return <Lock onUnlock={setSession} />;
+      return <Tracker session={session} theme={theme} setTheme={setTheme} />;
     }
 
-    // ====== App ======
-    function App({ passphrase, vaultKey, relock }) {
-      // Preferences (not sensitive)
-      const [gasUrl, setGasUrl] = useState(localStorage.getItem(PREF_GAS_URL) || "");
-      const [autoLoad, setAutoLoad] = useState(JSON.parse(localStorage.getItem(PREF_AUTO_LOAD) ?? "true"));
-      const [autoSave, setAutoSave] = useState(JSON.parse(localStorage.getItem(PREF_AUTO_SAVE) ?? "false"));
-      useEffect(()=>localStorage.setItem(PREF_GAS_URL, gasUrl), [gasUrl]);
-      useEffect(()=>localStorage.setItem(PREF_AUTO_LOAD, JSON.stringify(autoLoad)), [autoLoad]);
-      useEffect(()=>localStorage.setItem(PREF_AUTO_SAVE, JSON.stringify(autoSave)), [autoSave]);
+    // ========= Tracker =========
+    function Tracker({ session, theme, setTheme }) {
+      const { passphrase, vaultHash } = session;
 
-      // Allow first-time setup via URL param: ?gas=<encoded Apps Script URL>
-      useEffect(()=>{
-        const q = getQuery("gas");
-        if (q) {
-          const decoded = decodeURIComponent(q);
-          setGasUrl(decoded);
-          localStorage.setItem(PREF_GAS_URL, decoded);
-        }
-      }, []);
+      // cloud state
+      const [loading, setLoading] = useState(true);
+      const [error, setError] = useState("");
+      const [saving, setSaving] = useState(false);
+      const [lastSaved, setLastSaved] = useState(null);
 
-      // Compute vault hash for Drive key
-      const [vaultHash, setVaultHash] = useState("(hashing…)");
-      useEffect(()=>{ (async()=> setVaultHash(await sha256Base64Url(passphrase||"")))(); }, [passphrase]);
+      // app state
+      const [meName, setMeName] = useState("Me");
+      const [maxGames, setMaxGames] = useState(MAX_GAMES_DEFAULT);
+      const [opponents, setOpponents] = useState([
+        { id: crypto.randomUUID(), name: "Alice", games: Array(MAX_GAMES_DEFAULT).fill(null), photo: null },
+      ]);
 
-      // Decrypt local vault (if present), else defaults
-      const loadLocalEncrypted = () => {
-        try { const raw = localStorage.getItem(vaultKey); return raw ? JSON.parse(raw) : null; }
-        catch { return null; }
-      };
-
-      const [initState, setInitState] = useState(null);
-      const [ready, setReady] = useState(false);
-
-      useEffect(()=>{
-        (async()=>{
+      // load from Drive on first mount (cloud-only)
+      useEffect(() => {
+        (async () => {
           try {
-            const enc = loadLocalEncrypted();
+            const enc = await driveGet(GAS_WEB_APP_URL, vaultHash);
             if (enc) {
-              const dec = await decryptJSON(enc, passphrase);
-              setInitState({
-                opponents: (dec.opponents||[]).map(o => ({...o, photo:o.photo??null})) || [],
-                maxGames: dec.maxGames ?? MAX_GAMES_DEFAULT,
-                meName: dec.meName ?? "Me",
-                // If the Drive URL is stored in the vault, adopt it (useful after first cloud save)
-                _vaultGasUrl: dec.gasUrl || ""
-              });
-            } else {
-              setInitState({
-                opponents: [{ id: crypto.randomUUID(), name:"Alice", games:Array(MAX_GAMES_DEFAULT).fill(null), photo:null }],
-                maxGames: MAX_GAMES_DEFAULT,
-                meName: "Me",
-                _vaultGasUrl: ""
-              });
+              const data = await decryptJSON(enc, passphrase);
+              // adopt state
+              setMeName(data.meName ?? "Me");
+              setMaxGames(data.maxGames ?? MAX_GAMES_DEFAULT);
+              setOpponents((data.opponents || []).map(o => ({...o, photo:o.photo ?? null})));
+              setTheme(data.theme === "dark" ? "dark" : "light");
             }
-          } catch {
-            alert("Unlock failed. Wrong phrase or corrupted data.");
-            relock();
-            return;
+            setError("");
+          } catch (e) {
+            setError("Couldn't load from Google Drive. Check your Apps Script URL deployment.");
           } finally {
-            setReady(true);
+            setLoading(false);
           }
         })();
-      }, [vaultKey]);
-
-      if (!ready || !initState) {
-        return <div className="min-h-screen flex items-center justify-center text-gray-500">Loading…</div>;
-      }
-
-      // If local pref is empty but vault contained a gasUrl, adopt it
-      useEffect(()=>{
-        if (!gasUrl && initState._vaultGasUrl) setGasUrl(initState._vaultGasUrl);
-      }, [initState._vaultGasUrl]);
-
-      return (
-        <InnerApp
-          initial={initState}
-          passphrase={passphrase}
-          vaultKey={vaultKey}
-          gasUrl={gasUrl}
-          setGasUrl={setGasUrl}
-          autoLoad={autoLoad}
-          setAutoLoad={setAutoLoad}
-          autoSave={autoSave}
-          setAutoSave={setAutoSave}
-          vaultHash={vaultHash}
-          relock={relock}
-        />
-      );
-    }
-
-    function InnerApp({ initial, passphrase, vaultKey, gasUrl, setGasUrl, autoLoad, setAutoLoad, autoSave, setAutoSave, vaultHash, relock }) {
-      const [opponents, setOpponents] = useState(initial.opponents);
-      const [maxGames, setMaxGames] = useState(initial.maxGames);
-      const [meName, setMeName] = useState(initial.meName);
-      const [view, setView] = useState("tracker"); // tracker | league | settings
-
-      // Persist encrypted locally on any change (including gasUrl)
-      useEffect(()=>{
-        (async ()=>{
-          const payload = { opponents, maxGames, meName, gasUrl, ts: Date.now() };
-          const enc = await encryptJSON(payload, passphrase);
-          localStorage.setItem(vaultKey, JSON.stringify(enc));
-        })();
-      }, [opponents, maxGames, meName, gasUrl, passphrase, vaultKey]);
-
-      // ---- Auto-load from Drive after unlock ----
-      useEffect(()=>{
-        (async ()=>{
-          if (!autoLoad || !gasUrl) return;
-          try {
-            const enc = await driveLoad(gasUrl, vaultHash);
-            if (!enc) return; // nothing stored yet
-            const data = await decryptJSON(enc, passphrase);
-            // If the Drive payload contains a gasUrl, adopt it (keeps it in sync across devices)
-            if (data.gasUrl && data.gasUrl !== gasUrl) setGasUrl(data.gasUrl);
-            setOpponents((data.opponents||[]).map(o=>({...o, photo:o.photo??null})));
-            setMaxGames(data.maxGames ?? MAX_GAMES_DEFAULT);
-            setMeName(data.meName ?? "Me");
-          } catch (e) { console.warn("Auto-load failed:", e); }
-        })();
-        // run once on mount
-        // eslint-disable-next-line react-hooks/exhaustive-deps
       }, []);
 
-      // ---- Optional auto-save to Drive on changes ----
-      useEffect(()=>{
-        (async ()=>{
-          if (!autoSave || !gasUrl) return;
-          const payload = { opponents, maxGames, meName, gasUrl, ts: Date.now() };
+      // debounced cloud save on changes
+      const debouncedSave = useDebouncedCallback(async (payload) => {
+        try {
+          setSaving(true);
           const enc = await encryptJSON(payload, passphrase);
-          try { await driveSave(gasUrl, vaultHash, JSON.stringify(enc)); }
-          catch (e) { console.warn("Auto-save failed:", e); }
-        })();
-      }, [opponents, maxGames, meName, gasUrl, autoSave, passphrase, vaultHash]);
+          await drivePut(GAS_WEB_APP_URL, vaultHash, JSON.stringify(enc));
+          setLastSaved(new Date());
+        } catch (e) {
+          console.warn("Save failed:", e);
+          setError("Saving to Google Drive failed. Check your connection or Apps Script deployment.");
+        } finally {
+          setSaving(false);
+        }
+      }, 700);
 
-      // Manual cloud actions
-      async function saveToDrive() {
-        if (!gasUrl) { alert("Enter your Apps Script Web App URL in Settings."); return; }
-        const payload = { opponents, maxGames, meName, gasUrl, ts: Date.now() };
-        const enc = await encryptJSON(payload, passphrase);
-        await driveSave(gasUrl, vaultHash, JSON.stringify(enc));
-        alert("Saved to Drive.");
-      }
-      async function loadFromDrive() {
-        if (!gasUrl) { alert("Enter your Apps Script Web App URL in Settings."); return; }
-        const enc = await driveLoad(gasUrl, vaultHash);
-        if (!enc) { alert("No data found for this phrase yet."); return; }
-        const data = await decryptJSON(enc, passphrase);
-        if (data.gasUrl && data.gasUrl !== gasUrl) setGasUrl(data.gasUrl);
-        setOpponents((data.opponents||[]).map(o=>({...o, photo:o.photo??null})));
-        setMaxGames(data.maxGames ?? MAX_GAMES_DEFAULT);
-        setMeName(data.meName ?? "Me");
-        alert("Loaded from Drive.");
-      }
+      // trigger save when any data changes
+      useEffect(() => {
+        if (loading) return;
+        const payload = { meName, maxGames, opponents, theme, ts: Date.now() };
+        debouncedSave(payload);
+      }, [meName, maxGames, opponents, theme]); // eslint-disable-line
 
-      // Actions
-      const addOpponent = () => setOpponents(p => [...p, { id: crypto.randomUUID(), name:"New Opponent", games:Array(maxGames).fill(null), photo:null }]);
+      // actions
+      const addOpponent = () => {
+        setOpponents(p => [...p, { id: crypto.randomUUID(), name:"New Opponent", games:Array(maxGames).fill(null), photo:null }]);
+      };
       const removeOpponent = (id) => setOpponents(p => p.filter(o => o.id !== id));
       const renameOpponent = (id, name) => setOpponents(p => p.map(o => o.id===id ? {...o, name} : o));
-      const setResult = (id, i, val) => setOpponents(p => p.map(o => { if (o.id !== id) return o; const g=[...o.games]; g[i]=val; return {...o, games:g}; }));
+      const setResult = (id, idx, val) => setOpponents(p => p.map(o => {
+        if (o.id !== id) return o;
+        const g = [...o.games]; g[idx] = val; return {...o, games:g};
+      }));
       const cycleResult = (cur) => cur===null ? "W" : cur==="W" ? "L" : null;
       const clearResults = (id) => setOpponents(p => p.map(o => o.id===id ? {...o, games:Array(maxGames).fill(null)} : o));
       const quickFill = (id, v) => setOpponents(p => p.map(o => o.id===id ? {...o, games:o.games.map(()=>v)} : o));
 
-      // Photos
-      const setPhotoURL = (id) => { const url = prompt("Paste public image URL:"); if (!url) return; setOpponents(p => p.map(o => o.id===id ? {...o, photo:{type:"url", src:url}} : o)); };
-      const uploadPhotoFile = (id, file) => { if (!file) return; const rd=new FileReader(); rd.onload=()=>setOpponents(p=>p.map(o=>o.id===id?{...o,photo:{type:"data",src:rd.result}}:o)); rd.readAsDataURL(file); };
+      // handle games-per-opponent change (resize arrays)
+      const changeMaxGames = (n) => {
+        const newN = Math.max(1, Math.min(100, Number(n) || MAX_GAMES_DEFAULT));
+        setMaxGames(newN);
+        setOpponents(prev => prev.map(o => {
+          const g = [...o.games];
+          if (g.length > newN) g.length = newN;
+          if (g.length < newN) g.push(...Array(newN - g.length).fill(null));
+          return { ...o, games: g };
+        }));
+      };
+
+      // photos
+      const setPhotoURL = (id) => {
+        const url = prompt("Paste public image URL:");
+        if (!url) return;
+        setOpponents(p => p.map(o => o.id===id ? {...o, photo:{type:"url", src:url}} : o));
+      };
+      const uploadPhotoFile = (id, file) => {
+        if (!file) return;
+        const rd = new FileReader();
+        rd.onload = () => setOpponents(p => p.map(o => o.id===id ? {...o, photo:{type:"data", src:rd.result}} : o));
+        rd.readAsDataURL(file); // saved in cloud with the rest
+      };
       const clearPhoto = (id) => setOpponents(p => p.map(o => o.id===id ? {...o, photo:null} : o));
 
-      // Stats
-      const overall = useMemo(()=>{
-        const t = opponents.reduce((a,o)=>({ wins:a.wins+o.games.filter(x=>x==="W").length, losses:a.losses+o.games.filter(x=>x==="L").length }), {wins:0,losses:0});
+      // derived stats
+      const overall = useMemo(() => {
+        const t = opponents.reduce((a,o)=>({
+          wins: a.wins + o.games.filter(x=>x==="W").length,
+          losses: a.losses + o.games.filter(x=>x==="L").length
+        }), {wins:0,losses:0});
         const played = t.wins + t.losses;
         return { ...t, played, pct: played ? (t.wins/played)*100 : 0 };
       }, [opponents]);
 
-      const league = useMemo(()=>{
+      const league = useMemo(() => {
         const rows = opponents.map(o=>{
           const wins = o.games.filter(x=>x==="W").length;
           const losses = o.games.filter(x=>x==="L").length;
           const played = wins + losses;
           const pct = played ? (wins/played)*100 : 0;
-          return { id:o.id, name:o.name||"Opponent", wins, losses, played, pct, photo:o.photo };
+          return { id:o.id, name:o.name || "Opponent", wins, losses, played, pct, photo:o.photo };
         });
         rows.sort((a,b)=> b.pct - a.pct || b.played - a.played || a.name.localeCompare(b.name));
         return rows;
       }, [opponents]);
 
-      const Tab = ({ id, children }) => (
-        <button onClick={()=>setView(id)} className={clsx("px-3 py-2 rounded-2xl border shadow-sm text-sm", view===id ? "bg-black text-white" : "bg-white")}>
-          {children}
-        </button>
-      );
+      // UI state
+      const [view, setView] = useState("tracker"); // tracker | league | settings
+
+      if (loading) {
+        return (
+          <div className="min-h-screen flex items-center justify-center p-6">
+            <div className="text-gray-700 dark:text-neutral-200">Loading from Google Drive…</div>
+          </div>
+        );
+      }
 
       return (
-        <div className="min-h-screen text-gray-900 p-6">
+        <div className="min-h-screen text-gray-900 dark:text-neutral-100 p-6">
           <div className="max-w-6xl mx-auto">
             <header className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
               <div>
-                <h1 className="text-2xl font-bold">Office Pool Tracker</h1>
-                <p className="text-sm text-gray-600">Enter your phrase → auto-load from Google Drive (optional). Data stays encrypted.</p>
+                <h1 className="text-2xl font-bold">Pool Tracker</h1>
+                <p className="text-sm text-gray-600 dark:text-neutral-400">
+                  Cloud-only (Google Drive) • Encrypted with your phrase • Same URL on every device
+                </p>
+                {error && <div className="mt-2 text-sm text-red-600">{error}</div>}
               </div>
               <div className="flex flex-wrap gap-2 items-end">
-                <Tab id="tracker">Tracker</Tab>
-                <Tab id="league">League</Tab>
-                <Tab id="settings">Settings</Tab>
-                <button onClick={relock} className="px-3 py-2 rounded-2xl border shadow-sm text-sm">Lock</button>
+                <Tab id="tracker" view={view} setView={setView}>Tracker</Tab>
+                <Tab id="league"  view={view} setView={setView}>League</Tab>
+                <Tab id="settings"view={view} setView={setView}>Settings</Tab>
+                <button
+                  onClick={()=>setTheme(theme==="dark"?"light":"dark")}
+                  className="px-3 py-2 rounded-2xl border shadow-sm text-sm bg-white dark:bg-neutral-900 border-gray-200 dark:border-neutral-800"
+                  title="Toggle dark / light"
+                >
+                  {theme==="dark" ? "☀️ Light" : "🌙 Dark"}
+                </button>
               </div>
             </header>
+
+            {/* Status bar */}
+            <div className="mb-4 text-xs text-gray-500 dark:text-neutral-500">
+              {saving ? "Saving…" : lastSaved ? `Saved ${lastSaved.toLocaleTimeString()}` : "Ready"}
+            </div>
 
             {view==="tracker" && (
               <>
                 <section className="mb-6">
                   <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
-                    <div className="p-4 rounded-2xl bg-white shadow">
-                      <div className="text-xs text-gray-500">Your Name</div>
-                      <input value={meName} onChange={e=>setMeName(e.target.value)} className="mt-1 w-full px-3 py-2 rounded-xl border bg-white shadow-sm focus:outline-none" />
-                    </div>
-                    <div className="p-4 rounded-2xl bg-white shadow">
-                      <div className="text-xs text-gray-500">Games per Opponent</div>
-                      <input type="number" min={1} max={100} value={maxGames}
-                             onChange={e=>{ const n = Math.max(1, Math.min(100, Number(e.target.value)||MAX_GAMES_DEFAULT)); setMaxGames(n);
-                               setOpponents(prev=>prev.map(o=>{ const g=[...o.games]; if(g.length>n) g.length=n; if(g.length<n) g.push(...Array(n-g.length).fill(null)); return {...o, games:g}; })); }}
-                             className="mt-1 w-full px-3 py-2 rounded-xl border bg-white shadow-sm focus:outline-none" />
-                    </div>
-                    <div className="p-4 rounded-2xl bg-white shadow">
-                      <div className="text-xs text-gray-500">Overall Record</div>
-                      <div className="text-2xl font-semibold">{overall.wins} - {overall.losses}</div>
-                    </div>
-                    <div className="p-4 rounded-2xl bg-white shadow">
-                      <div className="text-xs text-gray-500">Win Rate</div>
-                      <div className="text-2xl font-semibold">{overall.played ? overall.pct.toFixed(1) : "0.0"}%</div>
-                    </div>
+                    <Card>
+                      <Label>Your Name</Label>
+                      <Input value={meName} onChange={e=>setMeName(e.target.value)} />
+                    </Card>
+                    <Card>
+                      <Label>Games per Opponent</Label>
+                      <Input type="number" min={1} max={100} value={maxGames}
+                        onChange={e=>changeMaxGames(e.target.value)} />
+                    </Card>
+                    <Card>
+                      <Label>Overall Record</Label>
+                      <Big>{overall.wins} - {overall.losses}</Big>
+                    </Card>
+                    <Card>
+                      <Label>Win Rate</Label>
+                      <Big>{overall.played ? overall.pct.toFixed(1) : "0.0"}%</Big>
+                    </Card>
                   </div>
                 </section>
 
                 <div className="mb-4 flex gap-2">
-                  <button onClick={addOpponent} className="px-4 py-2 rounded-2xl bg-black text-white shadow hover:opacity-90">+ Add Opponent</button>
+                  <button onClick={addOpponent} className="px-4 py-2 rounded-2xl bg-black text-white dark:bg-white dark:text-black shadow hover:opacity-90">+ Add Opponent</button>
                 </div>
 
                 <ul className="space-y-4">
@@ -358,44 +358,56 @@
                     const pct = played ? ((wins / played) * 100).toFixed(1) : "0.0";
 
                     return (
-                      <li key={o.id} className="bg-white rounded-2xl shadow p-4">
+                      <li key={o.id} className="bg-white dark:bg-neutral-900 rounded-2xl shadow p-4 border border-gray-200/70 dark:border-neutral-800">
                         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                           <div className="flex items-center gap-3">
-                            <div className="w-12 h-12 rounded-full bg-gray-100 overflow-hidden flex items-center justify-center">
+                            <div className="w-12 h-12 rounded-full bg-gray-100 dark:bg-neutral-800 overflow-hidden flex items-center justify-center">
                               {o.photo ? (
                                 <img src={o.photo.src} alt="" className="w-full h-full object-cover"/>
                               ) : (
-                                <span className="text-sm text-gray-500">{(o.name||"Opp")[0]}</span>
+                                <span className="text-sm text-gray-500 dark:text-neutral-400">{(o.name||"Opp")[0]}</span>
                               )}
                             </div>
-                            <input value={o.name} onChange={(e)=>renameOpponent(o.id, e.target.value)} className="px-3 py-2 rounded-xl border bg-white shadow-sm focus:outline-none font-medium" />
+                            <Input
+                              value={o.name}
+                              onChange={(e)=>renameOpponent(o.id, e.target.value)}
+                              className="font-medium"
+                            />
                           </div>
+
                           <div className="flex flex-wrap items-center gap-2">
-                            <span className="text-sm text-gray-600">{/* summary */}{meName} vs <span className="font-medium">{o.name || "Opponent"}</span> — {wins}-{losses} • {pct}%</span>
+                            <span className="text-sm text-gray-600 dark:text-neutral-400">
+                              {meName} vs <span className="font-medium">{o.name || "Opponent"}</span> — {wins}-{losses} • {pct}%
+                            </span>
                             <div className="flex gap-2">
-                              <button onClick={()=>quickFill(o.id,"W")} className="px-3 py-1 rounded-xl border shadow-sm">Fill W</button>
-                              <button onClick={()=>quickFill(o.id,"L")} className="px-3 py-1 rounded-xl border shadow-sm">Fill L</button>
-                              <button onClick={()=>clearResults(o.id)} className="px-3 py-1 rounded-xl border shadow-sm">Clear</button>
-                              <button onClick={()=>removeOpponent(o.id)} className="px-3 py-1 rounded-xl border shadow-sm text-red-600">Remove</button>
+                              <Mini onClick={()=>quickFill(o.id,"W")}>Fill W</Mini>
+                              <Mini onClick={()=>quickFill(o.id,"L")}>Fill L</Mini>
+                              <Mini onClick={()=>clearResults(o.id)}>Clear</Mini>
+                              <Mini onClick={()=>removeOpponent(o.id)} className="text-red-600">Remove</Mini>
                             </div>
                             <div className="flex gap-2 ml-2">
-                              <label className="px-3 py-1 rounded-xl border shadow-sm cursor-pointer">
+                              <label className="px-3 py-1 rounded-xl border shadow-sm cursor-pointer bg-white dark:bg-neutral-900 border-gray-200 dark:border-neutral-800">
                                 Upload Photo
                                 <input type="file" accept="image/*" className="hidden" onChange={(e)=>uploadPhotoFile(o.id, e.target.files[0])}/>
                               </label>
-                              <button onClick={()=>setPhotoURL(o.id)} className="px-3 py-1 rounded-xl border shadow-sm">Photo URL</button>
-                              {o.photo && <button onClick={()=>clearPhoto(o.id)} className="px-3 py-1 rounded-xl border shadow-sm">Clear Photo</button>}
+                              <Mini onClick={()=>setPhotoURL(o.id)}>Photo URL</Mini>
+                              {o.photo && <Mini onClick={()=>clearPhoto(o.id)}>Clear Photo</Mini>}
                             </div>
                           </div>
                         </div>
 
                         <div className="mt-4 flex flex-wrap gap-2">
                           {o.games.map((val, i) => (
-                            <button key={i} onClick={()=>setResult(o.id, i, (val===null ? "W" : val==="W" ? "L" : null))}
-                              className={clsx("w-10 h-10 rounded-xl border shadow-sm text-sm font-semibold",
-                                              val==="W" && "bg-green-100 border-green-300",
-                                              val==="L" && "bg-red-100 border-red-300")}
-                              title={`Game ${i+1}: ${val ?? "blank"}`}>
+                            <button
+                              key={i}
+                              onClick={()=>setResult(o.id, i, cycleResult(val))}
+                              className={clsx(
+                                "w-10 h-10 rounded-xl border shadow-sm text-sm font-semibold bg-white dark:bg-neutral-900 border-gray-200 dark:border-neutral-800",
+                                val==="W" && "bg-green-100 border-green-300 dark:bg-green-900/30 dark:border-green-800",
+                                val==="L" && "bg-red-100 border-red-300 dark:bg-red-900/30 dark:border-red-800"
+                              )}
+                              title={`Game ${i+1}: ${val ?? "blank"}`}
+                            >
                               {val ?? i+1}
                             </button>
                           ))}
@@ -408,14 +420,14 @@
             )}
 
             {view==="league" && (
-              <section className="bg-white rounded-2xl shadow p-4">
+              <section className="bg-white dark:bg-neutral-900 rounded-2xl shadow p-4 border border-gray-200/70 dark:border-neutral-800">
                 <div className="flex items-center justify-between mb-3">
                   <h2 className="text-lg font-semibold">League Table</h2>
-                  <div className="text-sm text-gray-500">Ranked by win % (then games played)</div>
+                  <div className="text-sm text-gray-500 dark:text-neutral-400">Ranked by win % (then games played)</div>
                 </div>
                 <div className="overflow-x-auto">
                   <table className="min-w-full text-sm">
-                    <thead className="text-left text-gray-600">
+                    <thead className="text-left text-gray-600 dark:text-neutral-400">
                       <tr>
                         <th className="py-2 pr-4">#</th>
                         <th className="py-2 pr-4">Opponent</th>
@@ -427,12 +439,12 @@
                     </thead>
                     <tbody>
                       {league.map((r,i)=>(
-                        <tr key={r.id} className="border-t">
+                        <tr key={r.id} className="border-t border-gray-200 dark:border-neutral-800">
                           <td className="py-2 pr-4">{i+1}</td>
                           <td className="py-2 pr-4">
                             <div className="flex items-center gap-2">
-                              <div className="w-8 h-8 rounded-full overflow-hidden bg-gray-100 flex items-center justify-center">
-                                {r.photo ? <img src={r.photo.src} alt="" className="w-full h-full object-cover"/> : <span className="text-xs text-gray-500">{(r.name||"O")[0]}</span>}
+                              <div className="w-8 h-8 rounded-full overflow-hidden bg-gray-100 dark:bg-neutral-800 flex items-center justify-center">
+                                {r.photo ? <img src={r.photo.src} alt="" className="w-full h-full object-cover"/> : <span className="text-xs text-gray-500 dark:text-neutral-400">{(r.name||"O")[0]}</span>}
                               </div>
                               <span className="font-medium">{r.name}</span>
                             </div>
@@ -450,74 +462,103 @@
             )}
 
             {view==="settings" && (
-              <section className="bg-white rounded-2xl shadow p-4 space-y-6">
-                <div>
-                  <h2 className="text-lg font-semibold mb-2">Google Drive (Apps Script) Sync</h2>
-                  <p className="text-sm text-gray-600 mb-2">Paste your Web App URL from Apps Script once per device, or open your page using <code>?gas=</code> in the URL. It’s also saved into your encrypted vault so future loads can adopt it.</p>
-                  <input placeholder="Apps Script Web App URL" className="w-full px-3 py-2 rounded-xl border bg-white shadow-sm"
-                         value={gasUrl} onChange={(e)=>setGasUrl(e.target.value)} />
-                  <div className="mt-3 flex flex-wrap gap-4 items-center">
-                    <label className="inline-flex items-center gap-2 text-sm">
-                      <input type="checkbox" checked={autoLoad} onChange={e=>setAutoLoad(e.target.checked)} />
-                      Auto-load on unlock
-                    </label>
-                    <label className="inline-flex items-center gap-2 text-sm">
-                      <input type="checkbox" checked={autoSave} onChange={e=>setAutoSave(e.target.checked)} />
-                      Auto-save changes
-                    </label>
-                    <button onClick={loadFromDrive} className="px-4 py-2 rounded-2xl border shadow-sm">Load now</button>
-                    <button onClick={saveToDrive} className="px-4 py-2 rounded-2xl bg-black text-white shadow">Save now</button>
-                  </div>
-                  <p className="text-xs text-gray-500 mt-2">
-                    Quick link trick: <code>?gas=</code> param. Example:
-                    <br/> <span className="font-mono">...?gas=https%3A%2F%2Fscript.google.com%2Fmacros%2Fs%2FYOUR_ID%2Fexec</span>
-                  </p>
+              <section className="bg-white dark:bg-neutral-900 rounded-2xl shadow p-4 border border-gray-200/70 dark:border-neutral-800 space-y-4">
+                <h2 className="text-lg font-semibold">Settings</h2>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                  <Card>
+                    <Label>Theme</Label>
+                    <div className="flex gap-2">
+                      <Mini onClick={()=>setTheme("light")} className={theme==="light" ? "bg-black text-white dark:bg-white dark:text-black" : ""}>Light</Mini>
+                      <Mini onClick={()=>setTheme("dark")}  className={theme==="dark"  ? "bg-black text-white dark:bg-white dark:text-black" : ""}>Dark</Mini>
+                    </div>
+                    <p className="text-xs text-gray-500 dark:text-neutral-500 mt-2">Theme is saved in the cloud with your data.</p>
+                  </Card>
+                  <Card>
+                    <Label>Current Vault</Label>
+                    <code className="text-xs break-all text-gray-600 dark:text-neutral-400">{vaultHash}</code>
+                    <p className="text-xs text-gray-500 dark:text-neutral-500 mt-2">Derived from your phrase. Different phrase = different vault file.</p>
+                  </Card>
+                  <Card>
+                    <Label>Cloud</Label>
+                    <p className="text-sm text-gray-600 dark:text-neutral-400">Google Drive via Apps Script (hardcoded URL). Nothing is stored locally.</p>
+                  </Card>
                 </div>
-
-                <div>
-                  <h2 className="text-lg font-semibold mb-2">Export / Import (manual backup)</h2>
-                  <div className="flex flex-wrap gap-2">
-                    <button className="px-4 py-2 rounded-2xl border shadow-sm"
-                      onClick={()=>{
-                        const data = { opponents, maxGames, meName, gasUrl };
-                        const blob = new Blob([JSON.stringify(data,null,2)], {type:"application/json"});
-                        const url = URL.createObjectURL(blob);
-                        const a = document.createElement("a"); a.href=url; a.download="pool-tracker-data.json"; a.click();
-                        setTimeout(()=>URL.revokeObjectURL(url), 1000);
-                      }}>Download JSON</button>
-                    <label className="px-4 py-2 rounded-2xl border shadow-sm cursor-pointer">
-                      Import JSON
-                      <input type="file" accept="application/json" className="hidden" onChange={(e)=>{
-                        const f = e.target.files && e.target.files[0]; if(!f) return;
-                        const rd = new FileReader();
-                        rd.onload = ()=> {
-                          try {
-                            const d = JSON.parse(rd.result);
-                            if (!Array.isArray(d.opponents)) throw new Error("Invalid file");
-                            if (d.gasUrl) setGasUrl(d.gasUrl);
-                            setOpponents(d.opponents.map(o=>({...o, photo:o.photo??null})));
-                            setMaxGames(d.maxGames||MAX_GAMES_DEFAULT);
-                            setMeName(d.meName||"Me");
-                            alert("Import complete.");
-                          } catch (err) { alert("Import failed: "+err.message); }
-                        };
-                        rd.readAsText(f);
-                      }}/></label>
-                  </div>
+                <div className="flex gap-2">
+                  <button
+                    onClick={async ()=>{
+                      const payload = { meName, maxGames, opponents, theme, ts:Date.now() };
+                      try {
+                        setSaving(true);
+                        const enc = await encryptJSON(payload, passphrase);
+                        await drivePut(GAS_WEB_APP_URL, vaultHash, JSON.stringify(enc));
+                        setLastSaved(new Date());
+                      } catch (e) {
+                        setError("Manual save failed.");
+                      } finally {
+                        setSaving(false);
+                      }
+                    }}
+                    className="px-4 py-2 rounded-2xl bg-black text-white dark:bg-white dark:text-black shadow"
+                  >
+                    Save now
+                  </button>
+                  <button
+                    onClick={async ()=>{
+                      try {
+                        setLoading(true);
+                        const enc = await driveGet(GAS_WEB_APP_URL, vaultHash);
+                        if (!enc) { alert("No cloud data found for this phrase yet."); return; }
+                        const data = await decryptJSON(enc, passphrase);
+                        setMeName(data.meName ?? "Me");
+                        setMaxGames(data.maxGames ?? MAX_GAMES_DEFAULT);
+                        setOpponents((data.opponents||[]).map(o=>({...o, photo:o.photo??null})));
+                        setTheme(data.theme === "dark" ? "dark" : "light");
+                      } catch (e) {
+                        setError("Manual load failed.");
+                      } finally {
+                        setLoading(false);
+                      }
+                    }}
+                    className="px-4 py-2 rounded-2xl border shadow-sm bg-white dark:bg-neutral-900 border-gray-200 dark:border-neutral-800"
+                  >
+                    Load now
+                  </button>
                 </div>
               </section>
             )}
 
-            <footer className="mt-10 text-xs text-gray-500 text-center">
-              <p>Use the same phrase on any device. For first-time setup on a device, either paste the Apps Script URL in Settings or open the site with <code>?gas=</code>.</p>
+            <footer className="mt-8 text-xs text-gray-500 dark:text-neutral-500 text-center">
+              <p>Your data lives only on Google Drive (encrypted). Losing your phrase means losing access.</p>
             </footer>
           </div>
         </div>
       );
     }
 
-    // Mount
-    ReactDOM.createRoot(document.getElementById("root")).render(<Shell />);
+    // simple UI atoms
+    const Tab = ({ id, view, setView, children }) => (
+      <button
+        onClick={()=>setView(id)}
+        className={clsx(
+          "px-3 py-2 rounded-2xl border shadow-sm text-sm bg-white dark:bg-neutral-900 border-gray-200 dark:border-neutral-800",
+          view===id && "bg-black text-white dark:bg-white dark:text-black"
+        )}
+      >{children}</button>
+    );
+    const Card = ({ children }) => (
+      <div className="p-4 rounded-2xl bg-white dark:bg-neutral-900 shadow border border-gray-200/70 dark:border-neutral-800">{children}</div>
+    );
+    const Label = ({ children }) => <div className="text-xs font-medium text-gray-600 dark:text-neutral-400">{children}</div>;
+    const Input = ({ className="", ...props }) => (
+      <input {...props} className={clsx("mt-1 px-3 py-2 rounded-xl border bg-white dark:bg-neutral-800 dark:text-white shadow-sm focus:outline-none w-full border-gray-200 dark:border-neutral-800", className)} />
+    );
+    const Big = ({ children }) => <div className="text-2xl font-semibold">{children}</div>;
+    const Mini = ({ className="", ...props }) => (
+      <button {...props} className={clsx("px-3 py-1 rounded-xl border shadow-sm bg-white dark:bg-neutral-900 border-gray-200 dark:border-neutral-800 text-sm", className)} />
+    );
+
+    // mount
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
   </script>
 </body>
 </html>
